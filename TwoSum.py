@@ -1,4 +1,3 @@
-```
 class Solution:
     def twoSum(self, nums, target):
         """
@@ -14,4 +13,6 @@ class Solution:
                 diff[target - nums[i]] = i
         return []
 
-```
+# Use a dictionary to record difference between each num and target
+# Time: O(n)
+# Space: O(n)
