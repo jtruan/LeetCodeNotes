@@ -1,3 +1,4 @@
+```
 class Solution:
     def twoSum(self, nums, target):
         """
@@ -12,3 +13,5 @@ class Solution:
             else:
                 diff[target - nums[i]] = i
         return []
+
+```
