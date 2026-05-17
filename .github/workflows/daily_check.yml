@@ -1,0 +1,48 @@
+name: Daily Flight Deal Check
+
+on:
+  schedule:
+    # Runs every day at 08:00 UTC (adjust to your preferred time)
+    - cron: "0 8 * * *"
+  workflow_dispatch: # allow manual trigger from the Actions UI
+
+jobs:
+  flight-deals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run flight deal search
+        env:
+          # --- Kiwi / Tequila API ---
+          TEQUILA_API_KEY: ${{ secrets.TEQUILA_API_KEY }}
+
+          # --- Email ---
+          NOTIFY_EMAIL:   ${{ secrets.NOTIFY_EMAIL }}
+          SMTP_FROM:      ${{ secrets.SMTP_FROM }}
+          SMTP_PASSWORD:  ${{ secrets.SMTP_PASSWORD }}
+
+          # --- Optional overrides (set as repo vars or leave defaults) ---
+          ORIGIN:                 ${{ vars.ORIGIN }}
+          MAX_PRICE_ROUND_TRIP:   ${{ vars.MAX_PRICE_ROUND_TRIP }}
+          MAX_PRICE_ONE_WAY:      ${{ vars.MAX_PRICE_ONE_WAY }}
+          MAX_FLIGHT_HOURS:       ${{ vars.MAX_FLIGHT_HOURS }}
+          DAYS_FROM_NOW_MIN:      ${{ vars.DAYS_FROM_NOW_MIN }}
+          SEARCH_WINDOW_DAYS:     ${{ vars.SEARCH_WINDOW_DAYS }}
+          EXCLUDE_DESTINATIONS:   ${{ vars.EXCLUDE_DESTINATIONS }}
+          INCLUDE_DESTINATIONS:   ${{ vars.INCLUDE_DESTINATIONS }}
+          TRIP_TYPE:              ${{ vars.TRIP_TYPE }}
+
+        run: python main.py
