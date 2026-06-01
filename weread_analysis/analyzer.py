@@ -1,18 +1,16 @@
 """微信读书数据分析与可视化"""
 
 import os
-import json
 import re
-from datetime import datetime, timedelta
-from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 import jieba
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import matplotlib.dates as mdates
 import seaborn as sns
+from collections import Counter
 from wordcloud import WordCloud
 
 from config import OUTPUT_DIR
@@ -27,33 +25,16 @@ def _setup_chinese_font():
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/System/Library/Fonts/PingFang.ttc",
-        "/Library/Fonts/Arial Unicode MS.ttf",
     ]
     for p in candidates:
         if os.path.exists(p):
             prop = fm.FontProperties(fname=p)
             matplotlib.rcParams["font.family"] = prop.get_name()
             return p
-    # fallback — 英文环境
     matplotlib.rcParams["font.family"] = "DejaVu Sans"
     return None
 
-FONT_PATH = _setup_chinese_font()
-
-
-def _wc_font():
-    """返回 WordCloud 可用的字体路径（优先中文）。"""
-    candidates = [
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return None
-
+_setup_chinese_font()
 
 STOPWORDS = set(
     "的 了 是 在 我 有 和 就 不 人 都 一 一个 上 也 很 到 说 要 去 你 "
@@ -62,133 +43,142 @@ STOPWORDS = set(
     "以及 还有 比如 而且 以下 之前 只有 其实 其中 能够 应该 ".split()
 )
 
+def _wc_font():
+    for p in [
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]:
+        if os.path.exists(p):
+            return p
+    return None
+
+def _ts(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d") if ts else ""
+
+def _sec_fmt(seconds: int) -> str:
+    h, m = divmod(int(seconds) // 60, 60)
+    return f"{h}小时{m}分钟" if h else f"{m}分钟"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  数据处理
-# ─────────────────────────────────────────────────────────────────────────────
-
 class WeReadAnalyzer:
     def __init__(self, data: dict):
-        self.books      = data.get("books", [])
-        self.bookmarks  = data.get("bookmarks", [])
-        self.reviews    = data.get("reviews", [])
-        self.history    = data.get("history", [])
-        self.notebooks  = data.get("notebooks", [])
+        self.books     = data.get("books", [])
+        self.albums    = data.get("albums", [])
+        self.bookmarks = data.get("bookmarks", [])
+        self.reviews   = data.get("reviews", [])
+        self.notebooks = data.get("notebooks", [])
+        self.rd_overall = data.get("readdata_overall", {})
+        self.rd_annual  = data.get("readdata_annually", {})
+        self.rd_monthly = data.get("readdata_monthly", {})
+        self._book_map  = {b["bookId"]: b for b in self.books if b.get("bookId")}
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # ── 书架统计 ──────────────────────────────────────────────────────────
-    def book_stats(self) -> dict:
-        total = len(self.books)
-        finished = sum(1 for b in self.books if b.get("finishReading") == 1)
-        categories = Counter(b.get("category", "未知") for b in self.books)
-        return {
-            "total":      total,
-            "finished":   finished,
-            "reading":    total - finished,
-            "categories": categories,
-        }
+    def title(self, book_id: str) -> str:
+        b = self._book_map.get(book_id, {})
+        return b.get("title", book_id)[:15]
 
-    # ── 阅读时长处理 ──────────────────────────────────────────────────────
-    def reading_time_df(self) -> pd.DataFrame:
-        rows = []
-        for rec in self.history:
-            ts = rec.get("readDate") or rec.get("timestamp")
-            dur = rec.get("readTime") or rec.get("duration", 0)  # 秒
-            bid = rec.get("bookId", "")
-            if ts and dur:
-                rows.append({"date": pd.to_datetime(ts, unit="s"), "minutes": dur / 60, "bookId": bid})
-        if not rows:
-            return pd.DataFrame(columns=["date", "minutes", "bookId"])
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-        return df.groupby(["date", "bookId"], as_index=False)["minutes"].sum()
-
-    # ── 划线文本 ──────────────────────────────────────────────────────────
     def all_highlight_text(self) -> str:
-        texts = []
-        for bm in self.bookmarks:
-            t = bm.get("markText") or bm.get("text", "")
-            if t:
-                texts.append(t)
-        return " ".join(texts)
+        return " ".join(bm.get("markText", "") for bm in self.bookmarks if bm.get("markText"))
 
     def all_note_text(self) -> str:
         texts = []
         for rv in self.reviews:
             r = rv.get("review", rv)
-            t = r.get("content") or r.get("abstract", "")
-            if t:
-                texts.append(t)
-        return " ".join(texts)
+            texts.append(r.get("content") or r.get("abstract", ""))
+        return " ".join(t for t in texts if t)
 
-    # ── 词频 ──────────────────────────────────────────────────────────────
-    def word_freq(self, text: str, topn: int = 50) -> Counter:
+    def word_freq(self, text: str, topn: int = 50):
         words = jieba.cut(text)
         return Counter(
             w for w in words
             if len(w) > 1 and w not in STOPWORDS and re.search(r"[一-鿿]", w)
         ).most_common(topn)
 
+    # ── 从 readdata 提取月度时长序列 ────────────────────────────────────
+    def monthly_hours(self) -> pd.Series:
+        """从 readdata_annually 的 readTimes 提取按月阅读时长（小时）。"""
+        rt = self.rd_annual.get("readTimes", {})
+        if not rt:
+            rt = self.rd_overall.get("readTimes", {})
+        if not rt:
+            return pd.Series(dtype=float)
+        s = pd.Series({
+            pd.Timestamp(int(k), unit="s"): v / 3600
+            for k, v in rt.items()
+        }).sort_index()
+        s.index = s.index.to_period("M").to_timestamp()
+        return s.groupby(level=0).sum()
+
+    # ── 偏好时段（preferTime 从 6 点起的 24 段，单位秒）────────────────
+    def prefer_time(self) -> list[int]:
+        return self.rd_overall.get("preferTime") or self.rd_annual.get("preferTime", [])
+
+    # ── 偏好分类 ──────────────────────────────────────────────────────────
+    def prefer_category(self) -> list[dict]:
+        return (
+            self.rd_overall.get("preferCategory")
+            or self.rd_annual.get("preferCategory", [])
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  可视化
+#  图表
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_overview(az: WeReadAnalyzer) -> str:
-    stats = az.book_stats()
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle("微信读书 · 总览", fontsize=18, fontweight="bold", y=1.02)
+    books    = az.books
+    total    = len(books) + len(az.albums)
+    finished = sum(1 for b in books if b.get("finishReading") == 1)
+    reading  = total - finished
 
-    # 1. 完读 vs 在读
-    sizes  = [stats["finished"], stats["reading"]]
-    labels = [f"已读完\n{stats['finished']} 本", f"阅读中\n{stats['reading']} 本"]
-    colors = ["#4CAF50", "#2196F3"]
-    wedges, texts, autotexts = axes[0].pie(
-        sizes, labels=labels, colors=colors,
+    # 分类来自 readdata preferCategory
+    cats = az.prefer_category()
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle("微信读书 · 总览", fontsize=18, fontweight="bold")
+
+    # 完读饼图
+    sizes  = [finished, reading]
+    labels = [f"已读完\n{finished} 本", f"阅读中\n{reading} 本"]
+    axes[0].pie(
+        sizes, labels=labels,
+        colors=["#4CAF50", "#2196F3"],
         autopct="%1.1f%%", startangle=90,
         wedgeprops={"edgecolor": "white", "linewidth": 2},
     )
-    for at in autotexts:
-        at.set_fontsize(11)
-    axes[0].set_title(f"书架共 {stats['total']} 本", fontsize=13)
+    axes[0].set_title(f"书架共 {total} 本", fontsize=13)
 
-    # 2. 分类分布（Top 8）
-    cats = stats["categories"].most_common(8)
+    # 偏好分类（来自官方数据）
     if cats:
-        cat_names, cat_vals = zip(*cats)
-        axes[1].barh(
-            list(cat_names)[::-1], list(cat_vals)[::-1],
-            color=sns.color_palette("Blues_d", len(cats)),
-        )
-        axes[1].set_xlabel("书籍数量")
-        axes[1].set_title("书籍分类分布", fontsize=13)
-        axes[1].tick_params(axis="y", labelsize=9)
+        top8  = sorted(cats, key=lambda x: x.get("readingTime", 0), reverse=True)[:8]
+        names = [c.get("categoryTitle", "") for c in top8][::-1]
+        times = [c.get("readingTime", 0) / 3600 for c in top8][::-1]
+        axes[1].barh(names, times, color=sns.color_palette("Blues_d", len(top8)))
+        axes[1].set_xlabel("阅读时长（小时）")
+        axes[1].set_title("偏好分类（阅读时长）", fontsize=13)
     else:
-        axes[1].text(0.5, 0.5, "暂无分类数据", ha="center", va="center", transform=axes[1].transAxes)
-        axes[1].set_title("书籍分类分布", fontsize=13)
+        axes[1].text(0.5, 0.5, "暂无分类数据", ha="center", va="center",
+                     transform=axes[1].transAxes, color="gray")
+        axes[1].set_title("偏好分类", fontsize=13)
 
-    # 3. 划线 / 笔记数量
-    bm_per_book = Counter(bm.get("bookId") for bm in az.bookmarks)
-    rv_per_book = Counter(
-        (rv.get("review") or rv).get("bookId") for rv in az.reviews
-    )
-    top_books = [b for b, _ in bm_per_book.most_common(10)]
-    book_titles = {}
-    for b in az.books:
-        book_titles[b.get("bookId", "")] = b.get("title", b.get("bookId", ""))
+    # 划线/笔记排行
+    bm_cnt = Counter(bm.get("bookId") for bm in az.bookmarks)
+    rv_cnt = Counter((rv.get("review") or rv).get("bookId") for rv in az.reviews)
+    top10  = [bid for bid, _ in bm_cnt.most_common(10)]
 
-    labels3 = [book_titles.get(bid, bid)[:8] for bid in top_books]
-    bm_vals  = [bm_per_book[bid] for bid in top_books]
-    rv_vals  = [rv_per_book.get(bid, 0) for bid in top_books]
-
+    labels3 = [az.title(bid) for bid in top10]
     x = range(len(labels3))
     w = 0.4
-    axes[2].bar([i - w/2 for i in x], bm_vals, width=w, label="划线", color="#FF9800")
-    axes[2].bar([i + w/2 for i in x], rv_vals, width=w, label="笔记", color="#9C27B0")
+    axes[2].bar([i - w/2 for i in x], [bm_cnt[bid] for bid in top10],
+                width=w, label="划线", color="#FF9800")
+    axes[2].bar([i + w/2 for i in x], [rv_cnt.get(bid, 0) for bid in top10],
+                width=w, label="笔记", color="#9C27B0")
     axes[2].set_xticks(list(x))
     axes[2].set_xticklabels(labels3, rotation=30, ha="right", fontsize=8)
     axes[2].set_ylabel("数量")
-    axes[2].set_title("划线 & 笔记最多的书（Top 10）", fontsize=13)
+    axes[2].set_title("划线 & 笔记 Top 10", fontsize=13)
     axes[2].legend()
 
     plt.tight_layout()
@@ -198,60 +188,15 @@ def plot_overview(az: WeReadAnalyzer) -> str:
     return path
 
 
-def plot_reading_heatmap(az: WeReadAnalyzer) -> str:
-    df = az.reading_time_df()
-    if df.empty:
-        return _no_data_plot("阅读时间热力图", "2_heatmap.png", "暂无阅读时长数据")
-
-    daily = df.groupby("date")["minutes"].sum().reset_index()
-    daily.columns = ["date", "minutes"]
-    daily["date"] = pd.to_datetime(daily["date"])
-
-    # 构造日历矩阵（最近 52 周）
-    end   = daily["date"].max()
-    start = end - timedelta(weeks=52)
-    idx   = pd.date_range(start, end, freq="D")
-    s = daily.set_index("date").reindex(idx, fill_value=0)["minutes"]
-
-    weeks = (s.index - s.index[0]).days // 7
-    dows  = s.index.dayofweek  # Mon=0
-
-    matrix = pd.DataFrame({"week": weeks, "dow": dows, "val": s.values})
-    pivot  = matrix.pivot(index="dow", columns="week", values="val").fillna(0)
-
-    fig, ax = plt.subplots(figsize=(20, 4))
-    sns.heatmap(
-        pivot, ax=ax, cmap="YlOrRd",
-        linewidths=0.3, linecolor="white",
-        cbar_kws={"label": "分钟"},
-        xticklabels=False,
-    )
-    ax.set_yticks(range(7))
-    ax.set_yticklabels(["周一","周二","周三","周四","周五","周六","周日"], rotation=0)
-    ax.set_title("阅读时间热力图（近一年每日分钟数）", fontsize=14)
-    ax.set_xlabel("")
-
-    plt.tight_layout()
-    path = os.path.join(OUTPUT_DIR, "2_heatmap.png")
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
-    return path
-
-
 def plot_monthly_trend(az: WeReadAnalyzer) -> str:
-    df = az.reading_time_df()
-    if df.empty:
-        return _no_data_plot("月度阅读趋势", "3_monthly.png", "暂无阅读时长数据")
-
-    df["month"] = df["date"].dt.to_period("M")
-    monthly = df.groupby("month")["minutes"].sum()
-    monthly.index = monthly.index.to_timestamp()
+    s = az.monthly_hours()
+    if s.empty:
+        return _no_data_plot("月度阅读趋势", "2_monthly.png", "暂无阅读时长数据")
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    ax.fill_between(monthly.index, monthly.values / 60, alpha=0.3, color="#2196F3")
-    ax.plot(monthly.index, monthly.values / 60, marker="o", color="#2196F3", linewidth=2)
-
-    for x, y in zip(monthly.index, monthly.values / 60):
+    ax.fill_between(s.index, s.values, alpha=0.3, color="#2196F3")
+    ax.plot(s.index, s.values, marker="o", color="#2196F3", linewidth=2)
+    for x, y in zip(s.index, s.values):
         if y > 0:
             ax.annotate(f"{y:.1f}h", (x, y), textcoords="offset points",
                         xytext=(0, 6), ha="center", fontsize=8, color="#1565C0")
@@ -262,14 +207,37 @@ def plot_monthly_trend(az: WeReadAnalyzer) -> str:
     ax.set_ylabel("阅读时长（小时）")
     ax.set_title("月度阅读时长趋势", fontsize=14)
     ax.grid(axis="y", alpha=0.3)
-
-    total_h = df["minutes"].sum() / 60
-    avg_h   = total_h / max(len(monthly), 1)
-    ax.axhline(avg_h, linestyle="--", color="gray", alpha=0.6, label=f"月均 {avg_h:.1f}h")
-    ax.legend()
+    if len(s) > 0:
+        avg = s.mean()
+        ax.axhline(avg, linestyle="--", color="gray", alpha=0.6, label=f"月均 {avg:.1f}h")
+        ax.legend()
 
     plt.tight_layout()
-    path = os.path.join(OUTPUT_DIR, "3_monthly.png")
+    path = os.path.join(OUTPUT_DIR, "2_monthly.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    return path
+
+
+def plot_prefer_time(az: WeReadAnalyzer) -> str:
+    pt = az.prefer_time()
+    if not pt or len(pt) < 24:
+        return _no_data_plot("阅读偏好时段", "3_prefer_time.png", "暂无时段数据")
+
+    # preferTime 从 6 点起排列
+    hours  = [(i + 6) % 24 for i in range(24)]
+    values = [pt[i] / 60 for i in range(24)]  # 秒 → 分钟
+
+    fig, ax = plt.subplots(figsize=(12, 5), subplot_kw={"polar": False})
+    bars = ax.bar(range(24), values, color=sns.color_palette("YlOrRd", 24))
+    ax.set_xticks(range(24))
+    ax.set_xticklabels([f"{h:02d}:00" for h in hours], rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("阅读时长（分钟）")
+    ax.set_title("24 小时阅读偏好时段", fontsize=14)
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, "3_prefer_time.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     return path
@@ -284,18 +252,11 @@ def plot_wordcloud(az: WeReadAnalyzer) -> str:
         w for w in jieba.cut(text)
         if len(w) > 1 and w not in STOPWORDS and re.search(r"[一-鿿]", w)
     )
-
-    wc_kwargs = dict(
-        width=1200, height=600,
-        background_color="white",
-        colormap="viridis",
-        max_words=200,
-        collocations=False,
-    )
-    if font := _wc_font():
-        wc_kwargs["font_path"] = font
-
-    wc = WordCloud(**wc_kwargs).generate(words)
+    wc_kw = dict(width=1200, height=600, background_color="white",
+                 colormap="viridis", max_words=200, collocations=False)
+    if fp := _wc_font():
+        wc_kw["font_path"] = fp
+    wc = WordCloud(**wc_kw).generate(words)
 
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.imshow(wc, interpolation="bilinear")
@@ -309,26 +270,24 @@ def plot_wordcloud(az: WeReadAnalyzer) -> str:
 
 
 def plot_top_highlights(az: WeReadAnalyzer) -> str:
-    """展示被划线最多的书 Top 10，以及总划线数走势。"""
     if not az.bookmarks:
-        return _no_data_plot("划线分析", "5_highlights.png", "暂无划线数据")
+        return _no_data_plot("划线排行", "5_highlights.png", "暂无划线数据")
 
-    book_titles = {b.get("bookId", ""): b.get("title", b.get("bookId", "")) for b in az.books}
     counter = Counter(bm.get("bookId") for bm in az.bookmarks)
     top10   = counter.most_common(10)
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    labels  = [book_titles.get(bid, bid)[:12] for bid, _ in top10]
+    labels  = [az.title(bid) for bid, _ in top10]
     vals    = [cnt for _, cnt in top10]
     colors  = sns.color_palette("Oranges_r", len(top10))
 
     bars = ax.barh(labels[::-1], vals[::-1], color=colors[::-1])
     for bar, v in zip(bars, vals[::-1]):
-        ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height() / 2,
+        ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
                 str(v), va="center", fontsize=9)
 
     ax.set_xlabel("划线数量")
-    ax.set_title(f"划线最多的书 Top 10（共 {len(az.bookmarks)} 条划线）", fontsize=14)
+    ax.set_title(f"划线最多的书 Top 10（共 {len(az.bookmarks)} 条）", fontsize=14)
     ax.grid(axis="x", alpha=0.3)
 
     plt.tight_layout()
@@ -339,87 +298,77 @@ def plot_top_highlights(az: WeReadAnalyzer) -> str:
 
 
 def generate_text_report(az: WeReadAnalyzer) -> str:
-    stats    = az.book_stats()
-    df       = az.reading_time_df()
-    total_h  = df["minutes"].sum() / 60 if not df.empty else 0
-    bm_count = len(az.bookmarks)
-    rv_count = len(az.reviews)
+    rd = az.rd_overall or az.rd_annual or az.rd_monthly
+    total_sec  = rd.get("totalReadTime", 0)
+    read_days  = rd.get("readDays", 0)
+    read_stat  = rd.get("readStat", [])
 
-    book_titles = {b.get("bookId", ""): b.get("title", b.get("bookId", "")) for b in az.books}
+    finished_cnt = sum(1 for b in az.books if b.get("finishReading") == 1)
+    total_books  = len(az.books) + len(az.albums)
 
-    # 划线最多的书
-    top_bm = Counter(bm.get("bookId") for bm in az.bookmarks).most_common(5)
-    # 笔记最多的书
-    top_rv = Counter(
-        (rv.get("review") or rv).get("bookId") for rv in az.reviews
-    ).most_common(5)
+    longest = rd.get("readLongest", [])
+    cats    = az.prefer_category()
+    pt_word = (rd.get("preferTimeWord") or az.rd_annual.get("preferTimeWord", ""))
+    prefer_author = rd.get("preferAuthor") or az.rd_annual.get("preferAuthor", [])
 
-    # 阅读连续天数
-    if not df.empty:
-        dates  = sorted(df["date"].dt.date.unique())
-        streak = _calc_streak(dates)
-    else:
-        streak = 0
+    bm_cnt = Counter(bm.get("bookId") for bm in az.bookmarks)
+    rv_cnt = Counter((rv.get("review") or rv).get("bookId") for rv in az.reviews)
 
     lines = [
-        "=" * 50,
-        "      微信读书年度阅读报告",
-        "=" * 50,
+        "=" * 52,
+        "       微信读书个人阅读报告",
+        "=" * 52,
         "",
         "【总览】",
-        f"  书架总数  : {stats['total']} 本",
-        f"  已读完    : {stats['finished']} 本",
-        f"  完读率    : {stats['finished']/max(stats['total'],1)*100:.1f}%",
-        f"  总阅读时长: {total_h:.1f} 小时",
-        f"  最长连读  : {streak} 天",
-        f"  划线总数  : {bm_count} 条",
-        f"  笔记总数  : {rv_count} 条",
-        "",
-        "【分类偏好 Top 5】",
+        f"  书架总数  : {total_books} 本（电子书 {len(az.books)}，有声书 {len(az.albums)}）",
+        f"  已读完    : {finished_cnt} 本",
+        f"  完读率    : {finished_cnt/max(len(az.books),1)*100:.1f}%",
+        f"  累计时长  : {_sec_fmt(total_sec)}",
+        f"  有效阅读天: {read_days} 天",
+        f"  划线总数  : {len(az.bookmarks)} 条",
+        f"  笔记总数  : {len(az.reviews)} 条",
     ]
-    for cat, n in stats["categories"].most_common(5):
-        lines.append(f"  {cat:<12}: {n} 本")
+
+    if read_stat:
+        lines += ["", "【阅读统计】"]
+        for s in read_stat:
+            lines.append(f"  {s.get('stat',''):8}: {s.get('counts','')}")
+
+    if cats:
+        lines += ["", "【偏好分类 Top 5】"]
+        for c in sorted(cats, key=lambda x: x.get("readingTime", 0), reverse=True)[:5]:
+            rt = _sec_fmt(c.get("readingTime", 0))
+            lines.append(f"  {c.get('categoryTitle',''):<12}: {c.get('readingCount',0)} 本  {rt}")
+
+    if longest:
+        lines += ["", "【阅读时长 Top 5】"]
+        for item in longest[:5]:
+            b = item.get("book") or item.get("albumInfo", {})
+            t = b.get("title") or b.get("name", "未知")
+            lines.append(f"  《{t[:15]}》  {_sec_fmt(item.get('readTime', 0))}")
+
+    if prefer_author:
+        lines += ["", "【偏好作者 Top 5】"]
+        for a in prefer_author[:5]:
+            lines.append(f"  {a.get('name',''):12}: {a.get('count',0)} 本  {a.get('readTime','')}")
+
+    if pt_word:
+        lines += ["", f"【阅读时段偏好】", f"  {pt_word}"]
 
     lines += ["", "【划线最多 Top 5】"]
-    for bid, cnt in top_bm:
-        lines.append(f"  《{book_titles.get(bid, bid)[:15]}》  {cnt} 条")
+    for bid, cnt in bm_cnt.most_common(5):
+        lines.append(f"  《{az.title(bid)}》  {cnt} 条")
 
     lines += ["", "【笔记最多 Top 5】"]
-    for bid, cnt in top_rv:
-        lines.append(f"  《{book_titles.get(bid, bid)[:15]}》  {cnt} 条")
+    for bid, cnt in rv_cnt.most_common(5):
+        lines.append(f"  《{az.title(bid)}》  {cnt} 条")
 
-    if not df.empty:
-        monthly = (
-            df.assign(month=df["date"].dt.to_period("M"))
-            .groupby("month")["minutes"].sum()
-        )
-        best_m  = monthly.idxmax()
-        lines  += [
-            "",
-            "【月度之最】",
-            f"  阅读最多月份: {best_m}  ({monthly[best_m]/60:.1f} 小时)",
-        ]
-
-    lines += ["", "=" * 50]
+    lines += ["", "=" * 52]
     report = "\n".join(lines)
-
     path = os.path.join(OUTPUT_DIR, "report.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(report)
     return path
-
-
-def _calc_streak(dates) -> int:
-    if not dates:
-        return 0
-    max_s = cur_s = 1
-    for i in range(1, len(dates)):
-        if (dates[i] - dates[i - 1]).days == 1:
-            cur_s += 1
-            max_s = max(max_s, cur_s)
-        else:
-            cur_s = 1
-    return max_s
 
 
 def _no_data_plot(title: str, filename: str, msg: str) -> str:
@@ -435,29 +384,20 @@ def _no_data_plot(title: str, filename: str, msg: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  一键生成全部报告
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_analysis(data: dict) -> list[str]:
     az = WeReadAnalyzer(data)
-
+    paths = []
     print("\n📊 生成总览图...")
-    paths = [plot_overview(az)]
-
-    print("🗓  生成阅读热力图...")
-    paths.append(plot_reading_heatmap(az))
-
+    paths.append(plot_overview(az))
     print("📈 生成月度趋势图...")
     paths.append(plot_monthly_trend(az))
-
+    print("🕐 生成偏好时段图...")
+    paths.append(plot_prefer_time(az))
     print("☁️  生成词云...")
     paths.append(plot_wordcloud(az))
-
-    print("🔖 生成划线分析...")
+    print("🔖 生成划线排行...")
     paths.append(plot_top_highlights(az))
-
     print("📝 生成文字报告...")
     paths.append(generate_text_report(az))
-
     print(f"\n✅ 所有图表已保存到 {OUTPUT_DIR}/")
     return paths
